@@ -74,9 +74,12 @@ The package is organized by responsibility and dependency boundary:
   checkpoints. Each component defines the data types it produces (e.g.
   `TrainingSample` in `training_sample_builder.py`, `TrainerStepBatch` in
   `batcher.py`).
-- `generator/` contains the standalone generator service and its inference
-  parallelism; `generator/vllm/` holds the vLLM engine integration and the
-  model-side adapters that run TorchTitan models in vLLM.
+- `generator/` contains the standalone generator service (`generator.py`), the
+  SPMD engine loop that drives it (`engine_loop.py`), request dispatch across
+  data-parallel replicas (`dispatcher.py`), inference-engine-agnostic types
+  (`types.py`), and inference parallelism. `generator/vllm/` holds everything
+  vLLM-specific: the engine (`engine.py`), its config, and the model-side
+  adapters that run TorchTitan models in vLLM.
 - `rollout/` contains rollout execution (`rollouter.py`), the user extension
   APIs for environments (`message_env.py`, `token_env.py`) and rewards
   (`rubric.py`), advantages, data loading, rollout recording, and the rollout

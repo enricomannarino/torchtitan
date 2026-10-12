@@ -4,13 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Tests for the `VLLMGenerator` continuous-batching mechanics.
+"""Tests for the generator's per-request pieces: `VLLMEngine` (with a fake vLLM
+`LLMEngine`), `RequestDispatcher`, and the `VLLMGenerator` config and endpoints.
 
-Exercises the per-request pieces in isolation with a fake vLLM engine — no Monarch,
-no GPU, no real model, and no broadcast (the engine loop's broadcast/step is a TP collective,
-not unit-tested here; `test_engine_loop.py` covers the decision logic in `_decide_next_action`).
-Covers completion (token-out + the metrics that ride with it),
-the SamplingParams contract, and the vLLM metric timing math.
+Exercises them in isolation -- no Monarch, no GPU, no real model, and no broadcast
+(`test_engine_loop.py` covers the engine loop). Covers completion (token-out + the
+metrics that ride with it), the SamplingParams contract, and the vLLM metric timing math.
 
 The uneven-decode integration test requires four GPUs and a torchrun launcher.
 """
@@ -32,27 +31,31 @@ import torch
 import torch.distributed as dist
 
 import torchtitan.rl.generator.generator as generator_module
+import torchtitan.rl.generator.vllm.engine as vllm_engine_module
 from torchstore import RankRole
 from torchtitan.components.optim import AdamW
 from torchtitan.config import CommConfig, DebugConfig
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.distributed.activation_remat import FullActivationRematConfig
 from torchtitan.models.common.attention import VarlenInnerAttention
-from torchtitan.rl.generator.generator import (
-    _extract_request_metrics_inputs,
+from torchtitan.rl.generator.dispatcher import (
     _prepare_generation_request_metrics,
     _RejectedRequests,
-    add_extra_vllm_engine_args,
-    EngineRequest,
-    LoopAction,
-    LoopDecision,
     OutstandingGeneration,
     RequestDispatcher,
-    SamplingConfig,
-    VLLMCudaGraphConfig,
-    VLLMGenerator,
 )
+from torchtitan.rl.generator.generator import VLLMGenerator
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
+from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
+from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig
+from torchtitan.rl.generator.vllm.engine import (
+    _build_sampling_params,
+    _extract_request_metrics_inputs,
+    _finished_request,
+    add_extra_vllm_engine_args,
+    build_engine_args,
+    VLLMEngine,
+)
 from torchtitan.rl.generator.vllm.registry import register_to_vllm
 from torchtitan.rl.generator.vllm.worker import (
     TorchTitanGPUModelRunner,
@@ -85,7 +88,7 @@ class _FakeRenderer:
         pass
 
 
-class _FakeEngine:
+class _FakeLLMEngine:
     def __init__(self):
         self.add_requests = []
         self.reset_prefix_cache_calls = []
@@ -132,19 +135,15 @@ def _request_output(
     )
 
 
-def _generator():
-    """A bare generator (no __init__ / engine build) with just the state the
-    per-request helpers (`_build_sampling_params`) read."""
-    generator = VLLMGenerator.__new__(VLLMGenerator)
-    generator._engine = _FakeEngine()
-    generator._rank = 0
-    generator.policy_version = 7
-    generator.config = SimpleNamespace(
-        sampling=SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4),
-        debug=SimpleNamespace(seed=None),
-        reset_kv_cache_on_model_state_dict_load=False,
+def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
+    """A `VLLMEngine` around a fake `LLMEngine` (no engine build)."""
+    engine = VLLMEngine.__new__(VLLMEngine)
+    engine._engine = _FakeLLMEngine()
+    engine._reset_kv_cache_on_model_state_dict_load = (
+        reset_kv_cache_on_model_state_dict_load
     )
-    return generator
+    engine._get_model = lambda: model
+    return engine
 
 
 def test_initialize_torchstore_client_uses_requester_index():
@@ -162,7 +161,7 @@ def test_initialize_torchstore_client_uses_requester_index():
 def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
     async def main():
         staging_state_dict = {"weight": "old"}
-        generator = _generator()
+        generator = VLLMGenerator.__new__(VLLMGenerator)
         generator._prefetched_model_state_dict = staging_state_dict
 
         def fill_state_dict(*args, **kwargs):
@@ -171,14 +170,17 @@ def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
             return {"weight": "fetched"}
 
         load_state_dict = Mock()
-        generator._get_model = lambda: SimpleNamespace(load_state_dict=load_state_dict)
-        generator._rank = 1
-        generator.config.reset_kv_cache_on_model_state_dict_load = False
+        engine = _vllm_engine(
+            model=SimpleNamespace(
+                load_state_dict=load_state_dict,
+                _prefetched_model_state_dict=staging_state_dict,
+            )
+        )
 
         get_state_dict = AsyncMock(side_effect=fill_state_dict)
         with patch.object(generator_module.ts, "get_state_dict", get_state_dict):
             await generator.prefetch_model_state_dict()
-            await generator._load_model_state_dict(3)
+        engine.load_prefetched_model_state_dict()
 
         assert generator._prefetched_model_state_dict is staging_state_dict
         get_state_dict.assert_awaited_once_with(
@@ -223,8 +225,10 @@ def test_process_finished_requests_resolves_reply_with_completion():
 
         dispatcher.process_finished_requests(
             [
-                _request_output(
-                    outputs=[_sample(token_ids=(10, 11), finish_reason="length")]
+                _finished_request(
+                    _request_output(
+                        outputs=[_sample(token_ids=(10, 11), finish_reason="length")]
+                    )
                 )
             ],
             policy_version=8,
@@ -255,7 +259,7 @@ def test_process_finished_requests_noop_on_nonzero_tp_rank():
     dispatcher = _dispatcher(rank=1, dp_degree=1, tp_degree=2)
     assert dispatcher._tp_rank != 0
     dispatcher.process_finished_requests(
-        [_request_output(request_id="r0")], policy_version=7
+        [_finished_request(_request_output(request_id="r0"))], policy_version=7
     )
     assert dispatcher._rank0_outstanding_generations == {}
 
@@ -275,7 +279,7 @@ def test_process_finished_requests_releases_dp_router_load():
         assert [h.reserved_load for h in dispatcher._rank0_dp_router._handles] == [1, 0]
 
         dispatcher.process_finished_requests(
-            [_request_output(request_id="r0")], policy_version=7
+            [_finished_request(_request_output(request_id="r0"))], policy_version=7
         )
 
         await asyncio.wrap_future(reply)
@@ -292,8 +296,7 @@ def test_process_finished_requests_releases_dp_router_load():
 def test_build_sampling_params_matches_contract():
     # seed and stop_token_ids are carried on the SamplingConfig (the rollouter
     # offsets the seed per sample); _build_sampling_params just reads them.
-    generator = _generator()
-    params = generator._build_sampling_params(
+    params = _build_sampling_params(
         SamplingConfig(
             temperature=0.3,
             max_tokens=64,
@@ -313,42 +316,10 @@ def test_build_sampling_params_matches_contract():
 
 
 def test_build_sampling_params_seed_defaults_to_none():
-    generator = _generator()
-    params = generator._build_sampling_params(
+    params = _build_sampling_params(
         SamplingConfig(temperature=0.8, max_tokens=8, stop_token_ids=[99])
     )
     assert params.seed is None
-
-
-def _admit_through_engine_loop(monkeypatch, generator, requests):
-    """Run the engine loop for one STEP decision that admits ``requests``, then CLOSE, and return
-    the ``(request_id, error)`` of each request the engine rejected."""
-    decisions = iter(
-        [
-            LoopDecision(action=LoopAction.STEP, requests_per_dp_rank=[requests]),
-            LoopDecision(action=LoopAction.CLOSE),
-        ]
-    )
-
-    async def decide_next_action(*carry_over):
-        return next(decisions)
-
-    generator._decide_next_action = decide_next_action
-    rejected_requests = []
-    generator._request_dispatcher = SimpleNamespace(
-        setup=lambda: None,
-        rank0_stamp_min_policy_version=lambda *args: None,
-        process_rejected_requests=rejected_requests.extend,
-        shutdown=AsyncMock(),
-        fail_outstanding_generations=lambda exc: None,
-        _dp_rank=0,
-    )
-    generator.config.max_engine_steps_between_decisions = 1
-    # A single rank already holds rank 0's decision.
-    generator._broadcast_group = None
-    monkeypatch.setattr(dist, "broadcast_object_list", lambda *args, **kwargs: None)
-    asyncio.run(generator._engine_loop())
-    return rejected_requests
 
 
 def _engine_request(request_id: str, *, min_policy_version: int):
@@ -363,47 +334,40 @@ def _engine_request(request_id: str, *, min_policy_version: int):
     return request
 
 
-def test_admission_salts_prompt_with_min_policy_version(monkeypatch):
-    # The pinned version (6), not the installed one (7), salts the prefix cache.
-    generator = _generator()
-    engine = cast(_FakeEngine, generator._engine)
+def test_admission_salts_prompt_with_min_policy_version():
+    # The request's pinned version, not the installed one, salts the prefix cache.
+    engine = _vllm_engine()
     request = _engine_request("r0", min_policy_version=6)
 
-    _admit_through_engine_loop(monkeypatch, generator, [request])
+    assert engine.add_requests([request]) == []
 
-    _, kwargs = engine.add_requests[0]
+    _, kwargs = cast(_FakeLLMEngine, engine._engine).add_requests[0]
     assert kwargs["prompt"]["cache_salt"] == "6"
 
 
-def test_admission_with_kv_reset_does_not_salt_prompt(monkeypatch):
-    generator = _generator()
-    generator.config.reset_kv_cache_on_model_state_dict_load = True
-    engine = cast(_FakeEngine, generator._engine)
+def test_admission_with_kv_reset_does_not_salt_prompt():
+    engine = _vllm_engine(reset_kv_cache_on_model_state_dict_load=True)
 
-    _admit_through_engine_loop(
-        monkeypatch, generator, [_engine_request("r0", min_policy_version=6)]
-    )
+    engine.add_requests([_engine_request("r0", min_policy_version=6)])
 
-    _, kwargs = engine.add_requests[0]
+    _, kwargs = cast(_FakeLLMEngine, engine._engine).add_requests[0]
     assert kwargs["prompt"]["cache_salt"] is None
 
 
-def test_admission_rejects_only_the_invalid_request(monkeypatch):
-    generator = _generator()
-    engine = cast(_FakeEngine, generator._engine)
+def test_admission_rejects_only_the_invalid_request():
+    engine = _vllm_engine()
     invalid = _engine_request("invalid", min_policy_version=6)
     invalid.sampling = SamplingConfig(max_tokens=0)
     valid = _engine_request("valid", min_policy_version=6)
 
-    rejected_requests = _admit_through_engine_loop(
-        monkeypatch, generator, [invalid, valid]
-    )
+    rejected_requests = engine.add_requests([invalid, valid])
 
     [(request_id, exc)] = rejected_requests
     assert request_id == "invalid"
     assert isinstance(exc, VLLMValidationError)
     assert "max_tokens must be at least 1" in str(exc)
-    assert [kwargs["request_id"] for _, kwargs in engine.add_requests] == ["valid"]
+    llm_engine = cast(_FakeLLMEngine, engine._engine)
+    assert [kwargs["request_id"] for _, kwargs in llm_engine.add_requests] == ["valid"]
 
 
 def test_process_rejected_requests_fails_only_their_replies():
@@ -470,25 +434,73 @@ def test_stamp_sets_outstanding_generation_min_policy_version():
     assert dispatcher._rank0_outstanding_generations["r1"].min_policy_version == 6
 
 
+def test_step_returns_finished_requests_without_grad():
+    engine = _vllm_engine()
+    grad_enabled = []
+
+    def step():
+        grad_enabled.append(torch.is_grad_enabled())
+        return [_request_output(outputs=[_sample(token_ids=(10, 11))])]
+
+    engine._engine.step = step
+
+    [finished] = engine.step()
+
+    assert grad_enabled == [False]
+    assert finished.request_id == "r0"
+    assert finished.token_ids == [10, 11]
+    assert finished.token_logprobs == [-0.1, -0.1]
+    assert finished.finish_reason == "stop"
+    assert finished.metrics_inputs.num_generation_tokens == 4
+
+
+def test_step_rejects_more_than_one_sample_per_request():
+    engine = _vllm_engine()
+    engine._engine.step = lambda: [_request_output(outputs=[_sample(), _sample()])]
+
+    with pytest.raises(ValueError, match="expected n=1"):
+        engine.step()
+
+
+def test_shutdown_closes_the_renderer():
+    engine = _vllm_engine()
+    engine._engine.renderer.shutdown = Mock()
+
+    engine.shutdown()
+
+    engine._engine.renderer.shutdown.assert_called_once_with()
+
+
+def test_prefetched_model_state_dict_is_the_buffers_the_load_reads():
+    # The generator prefetches into this dict, so it must be the one the load copies from.
+    buffers = {"weight": torch.zeros(1)}
+    loaded = []
+    engine = _vllm_engine(
+        model=SimpleNamespace(
+            load_state_dict=loaded.append, _prefetched_model_state_dict=buffers
+        )
+    )
+
+    assert engine.prefetched_model_state_dict is buffers
+    engine.load_prefetched_model_state_dict()
+    assert loaded == [buffers]
+
+
 @pytest.mark.parametrize("reset_kv_cache", [False, True])
 def test_reset_kv_cache_on_model_state_dict_load_controls_cache_reset(
-    monkeypatch, reset_kv_cache: bool
+    reset_kv_cache: bool,
 ):
-    async def run() -> None:
-        generator = _generator()
-        engine = cast(_FakeEngine, generator._engine)
-        generator.config.reset_kv_cache_on_model_state_dict_load = reset_kv_cache
-        generator._prefetched_model_state_dict = {}
-        model = SimpleNamespace(load_state_dict=lambda state_dict: None)
-        monkeypatch.setattr(generator, "_get_model", lambda: model)
+    model = SimpleNamespace(
+        load_state_dict=lambda state_dict: None, _prefetched_model_state_dict={}
+    )
+    engine = _vllm_engine(
+        reset_kv_cache_on_model_state_dict_load=reset_kv_cache, model=model
+    )
 
-        await generator._load_model_state_dict(version=8)
+    engine.load_prefetched_model_state_dict()
 
-        assert generator.policy_version == 8
-        expected = [((), {"reset_running_requests": True})] if reset_kv_cache else []
-        assert engine.reset_prefix_cache_calls == expected
-
-    asyncio.run(run())
+    expected = [((), {"reset_running_requests": True})] if reset_kv_cache else []
+    assert cast(_FakeLLMEngine, engine._engine).reset_prefix_cache_calls == expected
 
 
 def test_sampling_config_rejects_top_p_below_one():
@@ -531,7 +543,7 @@ def test_decode_metrics_absent_for_single_generated_token():
 
 # A valid inference parallelism; the model state dict load guards run after it is accepted.
 _PARALLELISM = InferenceParallelismConfig()
-# The fields of a model config that VLLMGenerator reads before building vLLM.
+# The fields of a model config that build_engine_args reads.
 _MODEL_CONFIG = SimpleNamespace(
     first_base_attention_backend=VarlenInnerAttention.Config(),
     max_context_length=1024,
@@ -588,33 +600,20 @@ def test_qwen36_27b_perf_config():
     assert config.generator.cuda_graph.mode == "FULL"
 
 
-# --- vLLM engine kwargs (what VLLMGenerator passes to EngineArgs) ---
+# --- vLLM engine kwargs (what build_engine_args passes to EngineArgs) ---
 
 
-def _build_engine_kwargs(monkeypatch, tmp_path, config: VLLMGenerator.Config) -> dict:
-    """Run ``VLLMGenerator.__init__`` up to ``EngineArgs`` and return its kwargs."""
-    # Raising stops __init__ right after it builds the engine kwargs.
-    engine_args = Mock(side_effect=RuntimeError("stop before the engine build"))
-    monkeypatch.setattr(generator_module, "EngineArgs", engine_args)
-    monkeypatch.setattr(generator_module, "register_to_vllm", Mock())
-    monkeypatch.setattr(generator_module, "init_logger", Mock())
-    monkeypatch.setattr(generator_module, "sl", Mock())
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
-    with pytest.raises(RuntimeError, match="stop before the engine build"):
-        VLLMGenerator(
-            config,
-            model_path="unused",
-            max_num_seqs=8,
-            output_dir=str(tmp_path),
-            rank=0,
-        )
+def _build_engine_kwargs(monkeypatch, config: VLLMGenerator.Config) -> dict:
+    """Run ``build_engine_args`` and return the kwargs it builds ``EngineArgs`` with."""
+    engine_args = Mock()
+    monkeypatch.setattr(vllm_engine_module, "EngineArgs", engine_args)
+    build_engine_args(config, model_path="unused", max_num_seqs=8)
     return engine_args.call_args.kwargs
 
 
-def test_extra_vllm_engine_args_reach_engine_args(monkeypatch, tmp_path):
+def test_extra_vllm_engine_args_reach_engine_args(monkeypatch):
     engine_kwargs = _build_engine_kwargs(
         monkeypatch,
-        tmp_path,
         VLLMGenerator.Config(
             model=_MODEL_CONFIG, extra_vllm_engine_args={"watermark": 0.03}
         ),

@@ -12,11 +12,9 @@ import pytest
 from torchtitan.config import OverrideConfig
 from torchtitan.rl import train
 from torchtitan.rl.controller.controller import AsyncLoopConfig
-from torchtitan.rl.generator.generator import (
-    SamplingConfig,
-    VLLMCudaGraphConfig,
-    VLLMGenerator,
-)
+from torchtitan.rl.generator.generator import VLLMGenerator
+from torchtitan.rl.generator.types import SamplingConfig
+from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig
 from torchtitan.rl.rollout.recorder import RolloutSampleRecorder
 from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
 

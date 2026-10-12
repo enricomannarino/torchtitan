@@ -42,7 +42,7 @@ from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import apply_overrides, ConfigLoader
 from torchtitan.distributed.batch_invariant import set_batch_invariance
 from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
-from torchtitan.rl.generator.generator import add_extra_vllm_engine_args
+from torchtitan.rl.generator.vllm.engine import add_extra_vllm_engine_args
 from torchtitan.rl.generator.vllm.registry import (
     register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
