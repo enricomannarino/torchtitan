@@ -778,6 +778,7 @@ def test_optim_update_clips_before_parameter_update() -> None:
                 get_optional_mesh=lambda name: None,
             ),
             parameters=[],
+            norm_parameters=[],
             optimizers=optimizers,
         ),
     )
@@ -798,6 +799,9 @@ def test_optim_update_clips_before_parameter_update() -> None:
 
 def test_initialize_optim_builds_component() -> None:
     optim = MagicMock()
+    logical_parameters = (MagicMock(),)
+    pipeline_runtime = MagicMock()
+    pipeline_runtime.parameters_for_grad_norm.return_value = logical_parameters
     optim_config = SimpleNamespace(build=MagicMock(return_value=optim))
     engine = cast(
         TrainingEngine,
@@ -810,6 +814,7 @@ def test_initialize_optim_builds_component() -> None:
             pp_has_last_stage=True,
             model_cls=SimpleNamespace(_register_optimizer_hooks=MagicMock()),
             parallelism_context=MagicMock(),
+            _pipeline_runtime=pipeline_runtime,
         ),
     )
 
@@ -821,6 +826,8 @@ def test_initialize_optim_builds_component() -> None:
         training_steps=10,
         pp_has_last_stage=True,
     )
+    pipeline_runtime.parameters_for_grad_norm.assert_called_once_with(optim.parameters)
+    optim.set_norm_parameters.assert_called_once_with(logical_parameters)
     engine.model_cls._register_optimizer_hooks.assert_called_once_with(
         optim.optimizers,
         engine.model_parts,
@@ -847,13 +854,16 @@ def test_optim_step_waits_for_checkpoint() -> None:
                 maybe_wait_for_staging=lambda: events.append("checkpoint")
             ),
             optim=optim,
+            _pipeline_runtime=SimpleNamespace(
+                finalize_gradients=lambda: events.append("finalize")
+            ),
         ),
     )
 
     grad_norm = TrainingEngine.optim_step(engine)
 
     torch.testing.assert_close(grad_norm, torch.tensor(2.0))
-    assert events == ["checkpoint", "optimization_3"]
+    assert events == ["finalize", "checkpoint", "optimization_3"]
     assert engine.num_completed_steps == 3
 
 
@@ -939,6 +949,7 @@ def test_trainer_accumulates_reused_cuda_graph_losses(
             metrics_processor=metrics_processor,
             num_completed_steps=0,
             ntokens_seen=3,
+            _pipeline_runtime=SimpleNamespace(finalize_gradients=lambda: None),
         ),
     )
     data_iterator = iter(
