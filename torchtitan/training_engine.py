@@ -35,6 +35,7 @@ from torchtitan.distributed.cuda_graph import (
     wrap_fwd_bwd_with_cuda_graph,
     wrap_with_cuda_graph,
 )
+from torchtitan.distributed.pipeline_parallel import initialize_pipeline_schedule
 from torchtitan.models.base import BaseModel
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.metrics import (
@@ -227,6 +228,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     device_memory_monitor: DeviceMemoryMonitor
     model_device_mem_stats: DeviceMemStats
     _run_forward_backward: _ForwardBackwardFn
+    _forward_backward_cuda_graph_enabled: bool
     _cuda_graph_per_accumulation_group_enabled: bool
     _dist_moe_runtime: "DistMoeRuntime | None"
 
@@ -249,6 +251,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.num_completed_steps = 0
         self.ntokens_seen = 0
         self.sdc_replayer = None
+        self._forward_backward_cuda_graph_enabled = False
         self._cuda_graph_per_accumulation_group_enabled = False
         self._dist_moe_runtime = None
         self.preprocess_inputs_kwargs: dict[str, Any] = {}
@@ -486,13 +489,17 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             ),
         )
         self._run_forward_backward = eager_forward_backward_fn
-        if self.config.training.disable_cuda_graphs or not cuda_graphs_supported():
+        self._forward_backward_cuda_graph_enabled = (
+            not self.config.training.disable_cuda_graphs and cuda_graphs_supported()
+        )
+        if not self._forward_backward_cuda_graph_enabled:
             return
 
         if self.config.training.cuda_graph_per_accumulation_group:
             graph_group_runner = wrap_with_cuda_graph(
                 eager_forward_backward_fn,
                 num_warmup_iterations=NUM_CUDA_GRAPH_WARMUP_STEPS,
+                name="forward_backward",
             )
 
             # TODO: Use multiple CUDA graphs to support variable group counts
@@ -532,6 +539,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 for parameter in model_part.parameters()
             ),
             num_warmup_iterations=NUM_CUDA_GRAPH_WARMUP_STEPS,
+            name="forward_backward",
         )
 
     @sl.log_trace_span("forward_backward")
@@ -564,6 +572,22 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             for model_kwargs in model_kwargs_collection:
                 if "aux_loss_denominators" in model_kwargs:
                     model_kwargs["aux_loss_denominators"] = global_routing_token_counts
+
+        if (
+            self.parallelism_context.pp_enabled
+            and self._forward_backward_cuda_graph_enabled
+        ):
+            arg_mbs, kwarg_mbs, target_mbs = preprocessed_microbatch_groups[0]
+            with self.parallelism_context.activate_spmd(
+                typechecking=self.config.debug.spmd_typechecking,
+            ):
+                initialize_pipeline_schedule(
+                    self.pp_schedule,
+                    args=arg_mbs[0] if arg_mbs is not None else (),
+                    kwargs=kwarg_mbs[0],
+                    target=target_mbs[0] if target_mbs is not None else None,
+                    loss_kwargs={"global_loss_token_counts": global_loss_token_counts},
+                )
 
         if self.sdc_replayer is not None:
             result = self.sdc_replayer.run_fwd_bwd(
@@ -820,12 +844,11 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             del self.profiler
 
     def close(self) -> None:
-        """Release CUDA graph and checkpoint resources owned by the trainer."""
+        """Finish pending work and release CUDA graph resources."""
         self.close_profiler()
-        if not self.config.training.disable_cuda_graphs:
-            cuda_graph_teardown()
         if self._dist_moe_runtime is not None:
             self._dist_moe_runtime.close()
             self._dist_moe_runtime = None
         if hasattr(self, "checkpointer"):
             self.checkpointer.close()
+        cuda_graph_teardown()

@@ -676,6 +676,22 @@ def muse_glimmer_debugmodel_fsdp2_deferred_gradient_reduction() -> Trainer.Confi
     return config
 
 
+def muse_glimmer_debugmodel_shared_eval_cuda_graph() -> Trainer.Config:
+    """Train and validate with shared graph workspace on two FSDP ranks."""
+    config = muse_glimmer_debugmodel(seq_len=128)
+    config.debug.deterministic = True
+    config.debug.seed = 42
+    config.parallelism.data_parallel_shard_degree = 2
+    config.optim.enable_cuda_graph = True
+    config.validator = Validator.Config(
+        enable_cuda_graphs=True,
+        freq=2,
+        steps=1,
+        dataloader=replace(config.dataloader),
+    )
+    return config
+
+
 def llama3_debugmodel_validation_tp2_cp2_pp2() -> Trainer.Config:
     config = llama3_debugmodel(seq_len=2048, attn_backend="flex")
     _set_spmd_typechecking(config, typechecking=False)
@@ -1062,6 +1078,13 @@ def build_features_test_list() -> list[IntegrationTestDefinition]:
             configs=[muse_glimmer_debugmodel_fsdp2_per_group_cuda_graph],
             test_descr="Per-group CUDA graph replay with FSDP accumulation",
             test_name="fsdp_per_group_cuda_graph",
+            ngpu=2,
+            skip_rocm_test=True,
+        ),
+        IntegrationTestDefinition(
+            configs=[muse_glimmer_debugmodel_shared_eval_cuda_graph],
+            test_descr="Shared train and eval CUDA graphs with FSDP",
+            test_name="shared_eval_cuda_graph",
             ngpu=2,
             skip_rocm_test=True,
         ),

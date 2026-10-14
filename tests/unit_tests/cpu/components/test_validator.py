@@ -34,8 +34,8 @@ class _ClosableLoader:
 
 
 class _EchoModel(nn.Module):
-    def preprocess_inputs(self, input_dict, *, parallelism_context, parallelism):
-        del parallelism_context, parallelism
+    def preprocess_inputs(self, input_dict, **kwargs):
+        del kwargs
         return input_dict["input"], input_dict["labels"], {}
 
     def forward(self, inputs, **kwargs):
@@ -57,13 +57,17 @@ class _FluxModel(nn.Module):
 def _generic_validator(loader):
     validator = object.__new__(Validator)
     validator.config = SimpleNamespace(steps=1)
+    validator._cuda_graph_enabled = False
+    validator._run_eval = None
     validator.parallelism_context = SimpleNamespace(
         dp_enabled=False,
         pp_enabled=False,
         dp_cp_enabled=False,
         activate_spmd=lambda **kwargs: nullcontext(),
     )
-    validator.dl_config = SimpleNamespace(build=mock.Mock(return_value=loader))
+    validator.dl_config = SimpleNamespace(
+        build=mock.Mock(return_value=loader), max_num_documents=None
+    )
     validator.dp_world_size = 1
     validator.dp_rank = 0
     validator.tokenizer = mock.Mock()
@@ -77,6 +81,87 @@ def _generic_validator(loader):
     validator.loss_fn = lambda predictions, labels: (predictions.sum(), None)
     validator.parallelism = SimpleNamespace()
     return validator
+
+
+def test_eval_wrapper_returns_each_real_run(monkeypatch):
+    from torchtitan.distributed.cuda_graph import (
+        is_cuda_graph_capture_enabled,
+        set_cuda_graph_capture_enabled,
+    )
+
+    row = TokenizedTrainingMicrobatch(
+        input=torch.ones(1, 1),
+        labels=torch.ones(1, 1, dtype=torch.long),
+        positions=torch.zeros(1, 1, dtype=torch.long),
+        padding_mask=torch.zeros(1, 1, dtype=torch.bool),
+        loss_token_counts=torch.tensor(1),
+        routing_token_counts=torch.tensor([1]),
+    )
+    loader = _ClosableLoader([row])
+    validator = _generic_validator(loader)
+    validator._cuda_graph_enabled = True
+    set_cuda_graph_capture_enabled(False)
+    model = _EchoModel()
+    model.register_buffer("counter", torch.tensor(0))
+    calls = []
+
+    def forward(inputs):
+        assert not model.training
+        assert not torch.is_grad_enabled()
+        calls.append(inputs)
+        model.counter.add_(1)
+        torch.rand(())
+        return inputs * model.counter
+
+    monkeypatch.setattr(model, "forward", forward)
+    wrap = mock.Mock(side_effect=lambda fn, **kwargs: fn)
+    monkeypatch.setattr(validator_module, "wrap_with_cuda_graph", wrap)
+    monkeypatch.setattr(validator_module.utils, "device_type", "cpu")
+    rng_before = torch.random.get_rng_state()
+    validator.validate([model], step=1)
+    assert len(calls) == 1
+    validator.metrics_processor.log_validation.assert_called_once_with(loss=1.0, step=1)
+    assert not is_cuda_graph_capture_enabled()
+    validator.validate([model], step=2)
+    assert len(calls) == 2
+    validator.metrics_processor.log_validation.assert_called_with(loss=2.0, step=2)
+    torch.testing.assert_close(calls[-1], row.input, rtol=0, atol=0)
+    assert model.training
+    assert model.counter.item() == 2
+    assert loader.closed
+    assert not torch.equal(torch.random.get_rng_state(), rng_before)
+    wrap.assert_called_once()
+    assert wrap.call_args.kwargs == {
+        "num_warmup_iterations": 1,
+        "name": "validation",
+    }
+    set_cuda_graph_capture_enabled(True)
+
+
+def test_validation_preprocessing_uses_validation_document_limit(monkeypatch):
+    row = TokenizedTrainingMicrobatch(
+        input=torch.ones(1, 1),
+        labels=torch.ones(1, 1, dtype=torch.long),
+        positions=torch.zeros(1, 1, dtype=torch.long),
+        padding_mask=torch.zeros(1, 1, dtype=torch.bool),
+        loss_token_counts=torch.tensor(1),
+        routing_token_counts=torch.tensor([1]),
+    )
+    validator = _generic_validator(_ClosableLoader([row]))
+    validator.dl_config.max_num_documents = 4
+    model = _EchoModel()
+    preprocess = mock.Mock(wraps=model.preprocess_inputs)
+    monkeypatch.setattr(model, "preprocess_inputs", preprocess)
+    monkeypatch.setattr(validator_module.utils, "device_type", "cpu")
+    validator.validate([model], step=1)
+    preprocess.assert_called_once()
+    assert preprocess.call_args.kwargs == {
+        "parallelism_context": validator.parallelism_context,
+        "parallelism": validator.parallelism,
+        "max_num_documents": 4,
+        "max_context_length": validator.seq_len,
+    }
+    torch.testing.assert_close(preprocess.call_args.args[0]["input"], row.input)
 
 
 @pytest.mark.parametrize("raises", [False, True])
@@ -94,6 +179,9 @@ def test_generic_validator_closes_temporary_loader(monkeypatch, raises):
     loader = _ClosableLoader([microbatch(), microbatch()])
     validator = _generic_validator(loader)
     model = _FailingModel() if raises else _EchoModel()
+    model.add_module("dropout", nn.Dropout())
+    model.dropout.eval()
+    modes = [module.training for module in model.modules()]
     monkeypatch.setattr(validator_module.utils, "device_type", "cpu")
     if raises:
         with pytest.raises(RuntimeError, match="validation failed"):
@@ -102,7 +190,13 @@ def test_generic_validator_closes_temporary_loader(monkeypatch, raises):
         validator.validate([model], step=1)
 
     assert loader.closed
+    assert [module.training for module in model.modules()] == modes
     validator.metrics_processor.reset.assert_called_once()
+
+
+def test_flux_validator_rejects_unimplemented_graph_capture():
+    with pytest.raises(ValueError, match="not implemented for FluxValidator"):
+        FluxValidator.Config(dataloader=mock.Mock(), steps=1, enable_cuda_graphs=True)
 
 
 def _flux_validator(loader):
