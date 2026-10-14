@@ -1,41 +1,40 @@
 # Monarch actors
 
 This package runs the standalone RL services on
-[Monarch](https://github.com/meta-pytorch/monarch). Each adapter is a thin
-Monarch `Actor` subclass of a service with no Monarch dependency of its own: it
-declares the service's methods as `@concurrent_endpoint`s and supplies
-Monarch-specific constructor arguments (rank, actor name, `Channel.open`).
-Domain behavior stays in the service.
+[Monarch](https://github.com/meta-pytorch/monarch). `MonarchActorSystem`
+implements the framework-agnostic `ActorSystem` (`rl/actors/system.py`), which
+the controller builds from `Controller.Config.actor_system` (default
+`MonarchActorSystem.Config()`) and spawns every service through.
+
+Each adapter is a thin Monarch `Actor` subclass of a service with no Monarch
+dependency of its own: it declares the service's methods as
+`@concurrent_endpoint`s and supplies Monarch-specific constructor arguments
+(rank, actor name, `Channel.open`). Domain behavior stays in the service.
 
 | Module | Purpose |
 | --- | --- |
+| `system.py` | `MonarchActorSystem`: provisions the proc meshes and torch-elastic setup, spawns each service's actors on them, initializes TorchStore on the trainer mesh, and stops the meshes. |
 | `trainer.py` | `TrainerActor`, the endpoints of `rl/trainer/trainer.py`'s `Trainer`. |
 | `generator.py` | `GeneratorActor`, the endpoints of `rl/generator/generator.py`'s `Generator`; supplies `Channel.open` for the data-parallel result fan-in. |
+| `router.py` | `InterGeneratorRouterActor`, the endpoints of `rl/routing/inter_generator.py`'s `InterGeneratorRouter`; enforces that the router is a singleton. |
 | `rollout_worker.py` | `RolloutWorkerActor`, a rollout worker in the controller-host CPU pool. |
+| `provisioning.py` | Proc meshes: the trainer and generator GPU meshes (`spawn_proc_mesh`, `PerHostProvisioner`), CPU procs on the controller host (`spawn_cpu_procs`), and the Monarch client's `shutdown`. |
 | `torch_elastic.py` | Sets the torch-elastic env vars (`RANK`, `MASTER_PORT`, ...) on a proc mesh before `init_process_group`; rank 0 keeps its rendezvous store port open so no other socket takes it. |
 
-## Monarch outside this package
+## Outside this package
 
-Some Monarch use still lives outside this package:
+No module outside this package imports Monarch or this package, except the
+controller's default for `Controller.Config.actor_system`, which imports
+`MonarchActorSystem` lazily. The controller, the rollouter and `train.py` use
+the abstract `ActorSystem`.
 
-| File | What it uses Monarch for |
-| --- | --- |
-| `rl/train.py` | Provisioning: `HostMesh`, `ProcMesh`, `this_host`, `default_bootstrap_cmd`, `shutdown_context`, and `PerHostProvisioner`. |
-| `rl/controller/controller.py` | Spawning the router process (`this_host`), torch-elastic setup, spawning `TrainerActor` and `GeneratorActor`, stopping meshes, and `ProcMesh` type hints. |
-| `rl/rollout/rollouter.py` | Spawning and stopping the rollout worker pool (`this_host`, `ProcMesh`, `RolloutWorkerActor`). |
-| `rl/routing/inter_generator.py` | `InterGeneratorRouter` is itself a Monarch `Actor` (`concurrent_endpoint`, `current_size`). |
+What remains outside is the call convention on the handles an actor system
+returns (see `ActorSystem`): `.call()` with `.get(rank)` on its result,
+`.call_one()`, `.choose()` and `.stream()`. The trainer and each generator come
+back as a `ServiceHandle` with an all-ranks and a rank-0 handle, so callers never
+slice meshes themselves. These calls appear in the controller, the rollouter
+(`.choose()` on the worker pool) and the router (on generator handles).
 
-The generator, its engine loop, dispatch and inference engines, the trainer,
-and the routing strategies do not import Monarch. The generator receives its
-result channel as a plain `open_result_channel` callable.
-
-The first three rows are spawning and teardown, which can move into this
-package. The router can take the same split as the trainer and generator: a
-plain class with the routing state and an actor adapter here. After both, no
-module outside this package imports Monarch.
-
-What remains is the call convention: endpoint calls such as
-`handle.endpoint.call()`, `.call_one()` and `.choose()`, and reading rank 0's
-result with `.get(0)`, in the controller, the rollouter and the router. A second
-actor framework (e.g. Ray) would add its own adapters next to this package
-rather than abstract this convention.
+Another actor framework (e.g. Ray) would add its own `ActorSystem`
+implementation and adapters, wrapping its handles to provide this call
+convention, and be selected with `Controller.Config.actor_system`.

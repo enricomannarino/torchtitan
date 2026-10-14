@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from torchtitan.rl.actors.system import ServiceHandle
 from torchtitan.rl.controller.controller import Controller
 
 TRAINER_PUSH_KEY = "timing/weight_sync/trainer_push_model_state_dict"
@@ -84,12 +85,13 @@ def _controller(events: list[str], *, on_push=None, on_pull=None) -> Controller:
     )
     controller.start_step = 0
     controller._trainer_policy_version = 0
-    controller.trainer = SimpleNamespace(
+    trainer = SimpleNamespace(
         sync_log_step=_Endpoint(),
         forward_backward=_Endpoint(forward_backward),
         optim_step=_Endpoint(optim_step),
         push_model_state_dict=_Endpoint(push),
     )
+    controller.trainer = ServiceHandle(all_ranks=trainer, rank0=trainer)
     controller.generator_router = SimpleNamespace(
         sync_log_step=_Endpoint(), pull_model_state_dict=_Endpoint(pull)
     )
