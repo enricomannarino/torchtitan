@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Monarch actor adapter for the standalone vLLM generator."""
+"""Monarch actor adapter for the standalone generator."""
 
 from __future__ import annotations
 

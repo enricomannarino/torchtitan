@@ -90,7 +90,9 @@ The package is organized by responsibility and dependency boundary:
 - `routing/` contains request routing across and within generators.
 - `actors/` contains actor-framework adapters; `actors/monarch/` holds the
   Monarch actor wrappers. Actor wrappers should contain endpoint adaptation
-  rather than domain behavior.
+  rather than domain behavior. See
+  [actors/monarch/README.md](actors/monarch/README.md) for where Monarch is
+  still used outside it.
 - `observability/` contains the RL metrics library.
 - `examples/` contains datasets, environments, rewards, integrations, and
   complete configuration recipes. Examples should configure reusable
