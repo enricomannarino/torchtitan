@@ -385,7 +385,7 @@ def _prepare_generation_request_metrics(
     # in SchedulerStats / IterationStats and require registering a
     # vllm.v1.metrics.loggers.StatLoggerBase via
     # LLMEngine.from_engine_args(..., stat_loggers=[...]); VllmOtelStatLogger
-    # does this when vllm_stat_logger is set.
+    # does this when VLLMEngine.Config.stat_logger is set.
 
     metric_values: dict[str, float] = {}
     if inputs.num_cached_tokens is not None:

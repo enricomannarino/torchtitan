@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The generator's SPMD engine loop and the engine thread it runs on."""
+"""The generator's SPMD engine loop and the thread it runs on."""
 
 from __future__ import annotations
 
@@ -16,25 +16,23 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar
+from typing import TypeVar
 
 import torch
 import torch.distributed as dist
 
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.generator.dispatcher import RequestDispatcher
+from torchtitan.rl.generator.engine import GenerationEngine
 from torchtitan.rl.generator.types import EngineRequest
 from torchtitan.rl.rollout.types import Completion
-
-if TYPE_CHECKING:
-    from torchtitan.rl.generator.vllm.engine import VLLMEngine
 
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
 
-class EngineThread:
+class EngineLoopThread:
     """A daemon thread running its own event loop, where the engine and the engine loop live.
 
     `engine.step()` blocks, so the engine and everything the engine loop touches run here,
@@ -52,7 +50,7 @@ class EngineThread:
         self.thread.start()
 
     def call(self, fn: Callable[[], _T]) -> _T:
-        """Call `fn` on the engine thread, in the caller's contextvars, and block until it returns.
+        """Call `fn` on the engine loop thread, in the caller's contextvars, and block until it returns.
         For setup, before the engine loop starts."""
         result: concurrent.futures.Future[_T] = concurrent.futures.Future()
 
@@ -103,7 +101,7 @@ class EngineLoop:
     For DP>1, the requests will be routed among DPs first. See RequestDispatcher's docstring for more details.
 
     Threading: the engine and everything the loop touches (queue, replies, dispatcher) live on
-    the engine thread, whose event loop is `event_loop`. `generate` and `load_model_state_dict`
+    the engine loop thread, whose event loop is `event_loop`. `generate` and `load_model_state_dict`
     run on the caller's event loop and reach the loop only through the thread-safe queue and the
     `concurrent.futures.Future`s it resolves. `release_groups` is an exception: it pops cache-salt
     pins directly; each pop, like the loop's `setdefault`, is a single dict operation, atomic
@@ -118,18 +116,18 @@ class EngineLoop:
     performs the local CPU-to-GPU copy.
 
     Args:
-        engine: The inference engine, built on the engine thread. The loop releases it on exit.
-        event_loop: The engine thread's event loop.
+        engine: The inference engine, built on the engine loop thread. The loop releases it on exit.
+        event_loop: The engine loop thread's event loop.
         request_dispatcher: Dispatches requests across DP replicas and resolves their replies.
         rank: Global rank of this process.
         broadcast_group: All-ranks gloo group that `LoopDecision`s are broadcast over.
-        max_engine_steps_between_decisions: ``VLLMGenerator.Config``'s field.
-        reset_kv_cache_on_model_state_dict_load: ``VLLMGenerator.Config``'s field.
+        max_engine_steps_between_decisions: ``Generator.Config``'s field.
+        reset_kv_cache_on_model_state_dict_load: ``Generator.Config``'s field.
     """
 
     def __init__(
         self,
-        engine: VLLMEngine,
+        engine: GenerationEngine,
         *,
         event_loop: asyncio.AbstractEventLoop,
         request_dispatcher: RequestDispatcher,
@@ -138,7 +136,7 @@ class EngineLoop:
         max_engine_steps_between_decisions: int,
         reset_kv_cache_on_model_state_dict_load: bool,
     ):
-        self._engine: VLLMEngine | None = engine
+        self._engine: GenerationEngine | None = engine
         self._event_loop = event_loop
         self._request_dispatcher = request_dispatcher
         self._rank = rank
@@ -161,12 +159,12 @@ class EngineLoop:
         # Rank 0: messages `generate` and `load_model_state_dict` put; the loop takes them off to decide.
         self._queue = EngineLoopQueue(event_loop)
 
-        # `_run` running on the engine thread's event loop, as a future any thread can await;
+        # `_run` running on the engine loop thread's event loop, as a future any thread can await;
         # None until `start` starts it.
         self._future: concurrent.futures.Future[None] | None = None
 
     def start(self) -> None:
-        """Start the loop on the engine thread (one-time, idempotent)."""
+        """Start the loop on the engine loop thread (one-time, idempotent)."""
         if self._future is None:
             self._future = asyncio.run_coroutine_threadsafe(
                 self._run(), self._event_loop
@@ -224,7 +222,7 @@ class EngineLoop:
 
         if self._future is None:
             # The loop never started (or an earlier `close` already awaited it), so release here, on
-            # the engine thread, which makes every engine call.
+            # the engine loop thread, which makes every engine call.
             await asyncio.wrap_future(
                 asyncio.run_coroutine_threadsafe(
                     self._release_resources(), self._event_loop
@@ -532,7 +530,7 @@ class EngineLoopQueue:
     which owns the queue.
 
     Args:
-        event_loop: The engine thread's event loop.
+        event_loop: The engine loop thread's event loop.
     """
 
     def __init__(self, event_loop: asyncio.AbstractEventLoop) -> None:

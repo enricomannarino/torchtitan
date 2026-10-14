@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """Tests for the generator's per-request pieces: `VLLMEngine` (with a fake vLLM
-`LLMEngine`), `RequestDispatcher`, and the `VLLMGenerator` config and endpoints.
+`LLMEngine`), `RequestDispatcher`, and the `Generator` config and endpoints.
 
 Exercises them in isolation -- no Monarch, no GPU, no real model, and no broadcast
 (`test_engine_loop.py` covers the engine loop). Covers completion (token-out + the
@@ -44,7 +44,7 @@ from torchtitan.rl.generator.dispatcher import (
     OutstandingGeneration,
     RequestDispatcher,
 )
-from torchtitan.rl.generator.generator import VLLMGenerator
+from torchtitan.rl.generator.generator import Generator
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
 from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig
@@ -53,7 +53,6 @@ from torchtitan.rl.generator.vllm.engine import (
     _extract_request_metrics_inputs,
     _finished_request,
     add_extra_vllm_engine_args,
-    build_engine_args,
     VLLMEngine,
 )
 from torchtitan.rl.generator.vllm.registry import register_to_vllm
@@ -148,7 +147,7 @@ def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
 
 def test_initialize_torchstore_client_uses_requester_index():
     async def main():
-        generator = VLLMGenerator.__new__(VLLMGenerator)
+        generator = Generator.__new__(Generator)
         client = AsyncMock()
         with patch.object(generator_module.ts, "client", client):
             await generator.initialize_torchstore_client(requester_index=3)
@@ -161,7 +160,7 @@ def test_initialize_torchstore_client_uses_requester_index():
 def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
     async def main():
         staging_state_dict = {"weight": "old"}
-        generator = VLLMGenerator.__new__(VLLMGenerator)
+        generator = Generator.__new__(Generator)
         generator._prefetched_model_state_dict = staging_state_dict
 
         def fill_state_dict(*args, **kwargs):
@@ -543,7 +542,7 @@ def test_decode_metrics_absent_for_single_generated_token():
 
 # A valid inference parallelism; the model state dict load guards run after it is accepted.
 _PARALLELISM = InferenceParallelismConfig()
-# The fields of a model config that build_engine_args reads.
+# The fields of a model config that VLLMEngine reads when it builds EngineArgs.
 _MODEL_CONFIG = SimpleNamespace(
     first_base_attention_backend=VarlenInnerAttention.Config(),
     max_context_length=1024,
@@ -552,7 +551,7 @@ _MODEL_CONFIG = SimpleNamespace(
 
 def test_generator_dp_requires_expert_parallelism():
     with pytest.raises(ValueError, match="Controller.Config.num_generators"):
-        VLLMGenerator.Config(
+        Generator.Config(
             model=_MODEL_CONFIG,
             parallelism=InferenceParallelismConfig(
                 data_parallel_degree=2,
@@ -563,7 +562,7 @@ def test_generator_dp_requires_expert_parallelism():
 
 
 def test_generator_dp_can_supply_expert_parallelism():
-    VLLMGenerator.Config(
+    Generator.Config(
         model=_MODEL_CONFIG,
         parallelism=InferenceParallelismConfig(
             data_parallel_degree=2,
@@ -575,7 +574,7 @@ def test_generator_dp_can_supply_expert_parallelism():
 
 def test_batch_invariant_requires_kv_cache_reset():
     with pytest.raises(ValueError, match="reset_kv_cache_on_model_state_dict_load"):
-        VLLMGenerator.Config(
+        Generator.Config(
             model=_MODEL_CONFIG,
             parallelism=_PARALLELISM,
             debug=DebugConfig(batch_invariant=True),
@@ -597,25 +596,50 @@ def test_qwen36_27b_perf_config():
     assert isinstance(optimizer, AdamW.Config)
     assert optimizer.moment_dtype == "bfloat16"
     assert isinstance(config.trainer.activation_remat, FullActivationRematConfig)
-    assert config.generator.cuda_graph.mode == "FULL"
+    assert config.generator.engine.cuda_graph.mode == "FULL"
 
 
-# --- vLLM engine kwargs (what build_engine_args passes to EngineArgs) ---
+# --- vLLM engine kwargs (what VLLMEngine passes to EngineArgs) ---
 
 
-def _build_engine_kwargs(monkeypatch, config: VLLMGenerator.Config) -> dict:
-    """Run ``build_engine_args`` and return the kwargs it builds ``EngineArgs`` with."""
+def _build_engine_kwargs(monkeypatch, tmp_path, config: Generator.Config) -> dict:
+    """Build ``config.engine`` as the generator does, with vLLM's ``EngineArgs``,
+    ``LLMEngine`` and model registration mocked; return the ``EngineArgs`` kwargs."""
     engine_args = Mock()
     monkeypatch.setattr(vllm_engine_module, "EngineArgs", engine_args)
-    build_engine_args(config, model_path="unused", max_num_seqs=8)
+    monkeypatch.setattr(vllm_engine_module, "LLMEngine", Mock())
+    monkeypatch.setattr(vllm_engine_module, "register_to_vllm", Mock())
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    config.engine.build(
+        model=config.model,
+        parallelism=config.parallelism,
+        model_path="unused",
+        max_num_seqs=8,
+        model_dtype=config.model_dtype,
+        gpu_memory_limit=config.gpu_memory_limit,
+        max_num_batched_tokens=config.max_num_batched_tokens,
+        checkpointer=None,
+        dist_moe_runtime=None,
+        debug=config.debug,
+        reset_kv_cache_on_model_state_dict_load=False,
+        rank=0,
+        generator_name="generator",
+        output_dir=str(tmp_path),
+    )
     return engine_args.call_args.kwargs
 
 
-def test_extra_vllm_engine_args_reach_engine_args(monkeypatch):
+def test_generator_defaults_to_the_vllm_engine():
+    assert isinstance(Generator.Config(model=_MODEL_CONFIG).engine, VLLMEngine.Config)
+
+
+def test_extra_engine_args_reach_engine_args(monkeypatch, tmp_path):
     engine_kwargs = _build_engine_kwargs(
         monkeypatch,
-        VLLMGenerator.Config(
-            model=_MODEL_CONFIG, extra_vllm_engine_args={"watermark": 0.03}
+        tmp_path,
+        Generator.Config(
+            model=_MODEL_CONFIG,
+            engine=VLLMEngine.Config(extra_engine_args={"watermark": 0.03}),
         ),
     )
     assert engine_kwargs["watermark"] == 0.03
@@ -630,12 +654,12 @@ def test_extra_vllm_engine_args_reach_engine_args(monkeypatch):
         # Set only when the config field is set, so absent from engine_kwargs here.
         (
             "max_num_batched_tokens",
-            r"use VLLMGenerator\.Config\.max_num_batched_tokens",
+            r"use Generator\.Config\.max_num_batched_tokens",
         ),
-        ("seed", r"use VLLMGenerator\.Config\.debug\.seed"),
+        ("seed", r"use Generator\.Config\.debug\.seed"),
     ],
 )
-def test_extra_vllm_engine_args_rejects_torchtitan_owned_keys(key, match):
+def test_extra_engine_args_rejects_torchtitan_owned_keys(key, match):
     engine_kwargs = {"scheduling_policy": "fcfs"}
     with pytest.raises(ValueError, match=match):
         add_extra_vllm_engine_args(engine_kwargs, {key: 1})

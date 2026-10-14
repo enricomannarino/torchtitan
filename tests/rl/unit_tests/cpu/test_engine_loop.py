@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """Unit tests for the generator's `EngineLoop`: its decision logic (`_decide_next_action`)
-and the engine thread it runs on.
+and the thread it runs on.
 
 Built on a fake engine, so the loop's admit/load/shutdown branching is tested without
 vLLM or a GPU.
@@ -37,13 +37,13 @@ from torchtitan.rl.generator.engine_loop import (
     EngineLoop,
     EngineLoopMessage,
     EngineLoopQueue,
-    EngineThread,
+    EngineLoopThread,
     GenerationMessage,
     LoopAction,
     LoopDecision,
     ModelStateDictLoadMessage,
 )
-from torchtitan.rl.generator.generator import VLLMGenerator
+from torchtitan.rl.generator.generator import Generator
 from torchtitan.rl.generator.types import (
     EngineRequest,
     FinishedRequest,
@@ -501,7 +501,7 @@ def test_release_groups_drops_pins(runner) -> None:
     )
 
 
-# --- engine thread ---
+# --- engine loop thread ---
 
 
 def _finished(request_id: str) -> FinishedRequest:
@@ -613,8 +613,8 @@ class _StepGate:
         self._released.set()
 
 
-def _stop_engine_thread(engine_thread: EngineThread) -> None:
-    # Production never stops the engine thread's event loop; tests do, to join the thread.
+def _stop_engine_thread(engine_thread: EngineLoopThread) -> None:
+    # Production never stops the engine loop thread's event loop; tests do, to join the thread.
     event_loop = engine_thread.event_loop
     event_loop.call_soon_threadsafe(event_loop.stop)
     engine_thread.thread.join(timeout=_TIMEOUT_S)
@@ -624,16 +624,16 @@ def _stop_engine_thread(engine_thread: EngineThread) -> None:
 
 @pytest.fixture
 def engine_thread(monkeypatch):
-    """Returns a function that builds an engine loop around `engine`, with its engine thread
+    """Returns a function that builds an engine loop around `engine`, with its engine loop thread
     running; stops those threads afterwards."""
     # Rank 0 is the only rank, so the decision broadcast is a no-op.
     monkeypatch.setattr(
         engine_loop_module.dist, "broadcast_object_list", lambda *a, **k: None
     )
-    engine_threads: list[EngineThread] = []
+    engine_threads: list[EngineLoopThread] = []
 
     def start(engine: _FakeEngine, **kwargs: Any) -> EngineLoop:
-        thread = EngineThread(name="vllm-engine")
+        thread = EngineLoopThread(name="engine-loop")
         engine_threads.append(thread)
         engine_loop = _bare_loop(event_loop=thread.event_loop, engine=engine, **kwargs)
         engine_loop.engine_thread = thread  # for the tests to check
@@ -664,7 +664,7 @@ def _generate(engine_loop: EngineLoop, request_id: str, **kwargs: Any) -> asynci
 
 
 async def _on_engine_loop(engine_loop: EngineLoop, fn: Callable[[], Any]) -> Any:
-    """Run `fn` on the engine thread's event loop and return its result."""
+    """Run `fn` on the engine loop thread's event loop and return its result."""
 
     async def call() -> Any:
         return fn()
@@ -677,7 +677,7 @@ async def _on_engine_loop(engine_loop: EngineLoop, fn: Callable[[], Any]) -> Any
 def test_call_on_engine_thread_runs_on_it_in_the_callers_context() -> None:
     caller_context = contextvars.ContextVar("caller_context", default=None)
     caller_context.set("caller")
-    engine_thread = EngineThread(name="vllm-engine")
+    engine_thread = EngineLoopThread(name="engine-loop")
     try:
         result = engine_thread.call(
             lambda: (threading.current_thread(), caller_context.get())
@@ -693,7 +693,7 @@ def test_call_on_engine_thread_raises_any_failure_to_the_caller() -> None:
     def fail():
         raise SystemExit("build failed")
 
-    engine_thread = EngineThread(name="vllm-engine")
+    engine_thread = EngineLoopThread(name="engine-loop")
     try:
         with pytest.raises(SystemExit, match="build failed"):
             engine_thread.call(fail)
@@ -711,8 +711,8 @@ def test_close_releases_the_engine() -> None:
         built.append(weakref.ref(engine))
         return engine
 
-    engine_thread = EngineThread(name="vllm-engine")
-    # Built as `VLLMGenerator.__init__` builds it, so the engine thread must keep no reference to it.
+    engine_thread = EngineLoopThread(name="engine-loop")
+    # Built as `Generator.__init__` builds it, so the engine loop thread must keep no reference to it.
     engine_loop = _bare_loop(
         event_loop=engine_thread.event_loop, engine=engine_thread.call(build_engine)
     )
@@ -734,7 +734,7 @@ def test_actor_loop_takes_calls_while_the_engine_steps(engine_thread) -> None:
         engine_loop = engine_thread(engine)
         engine_loop.start()
         first = _generate(engine_loop, "r0")
-        # engine.step() blocks the engine thread, not this loop.
+        # engine.step() blocks the engine loop thread, not this loop.
         assert await asyncio.to_thread(gate.entered.wait, _TIMEOUT_S)
         second = _generate(engine_loop, "r1")
         gate.release()
@@ -767,7 +767,7 @@ def test_load_runs_on_the_engine_thread(engine_thread, monkeypatch) -> None:
 
     async def run() -> None:
         engine_loop = engine_thread(_loading_engine(monkeypatch, load_pre_hook))
-        # Set after the engine thread started, so only `start` can carry it there.
+        # Set after the engine loop thread started, so only `start` can carry it there.
         endpoint_context.set("endpoint")
         engine_loop.start()
 
@@ -798,7 +798,7 @@ def test_generate_endpoint_queues_a_request_with_the_default_sampling(
 
     async def run() -> None:
         # The generator's endpoints around the engine loop, without building vLLM.
-        generator = object.__new__(VLLMGenerator)
+        generator = object.__new__(Generator)
         generator.config = SimpleNamespace(sampling=sampling)
         generator._engine_loop = engine_thread(engine)
         await generator.start_engine_loop()
@@ -847,7 +847,7 @@ def test_prefetch_reads_torchstore_on_the_actor_loop_while_the_engine_steps(
 
     async def run() -> None:
         # The generator's endpoints around the engine loop, without building vLLM.
-        generator = object.__new__(VLLMGenerator)
+        generator = object.__new__(Generator)
         generator._engine_loop = engine_thread(engine)
         generator._prefetched_model_state_dict = {}
         await generator.start_engine_loop()
@@ -973,7 +973,7 @@ def test_generate_cancelled_on_the_queue_never_reaches_the_engine(
         first = _generate(engine_loop, "r0")
         assert await asyncio.to_thread(gate.entered.wait, _TIMEOUT_S)
         cancelled = _generate(engine_loop, "r1")
-        # r1 is put on the queue, which the held engine thread can't drain.
+        # r1 is put on the queue, which the held engine loop thread can't drain.
         await asyncio.sleep(0)
         cancelled.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1055,10 +1055,10 @@ def test_close_fails_outstanding_requests_and_later_calls(engine_thread) -> None
         # Runs after `close` has closed the queue, while the loop still runs, so the guard rejects it
         # before it reaches the queue.
         during_close = _generate(engine_loop, "r2")
-        # Run all four calls while `step` holds the engine thread, so the loop takes the load and the
+        # Run all four calls while `step` holds the engine loop thread, so the loop takes the load and the
         # `CloseMessage` off the queue together; alone, the load would run on `_StuckEngine`.
         await asyncio.sleep(0)
-        # `close` and the rejected call ran on this loop, without waiting for the engine thread.
+        # `close` and the rejected call ran on this loop, without waiting for the engine loop thread.
         assert engine_loop._queue.closed and during_close.done()
         gate.release()
 

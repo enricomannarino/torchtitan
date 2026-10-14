@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from vllm import EngineArgs, LLMEngine, SamplingParams
@@ -20,7 +21,13 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan.config import DebugConfig
 from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
+from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.dist_moe import DistMoeRuntime
+from torchtitan.rl.generator.engine import GenerationEngine
+from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import (
     EngineRequest,
     FinishedRequest,
@@ -30,6 +37,7 @@ from torchtitan.rl.generator.types import (
 from torchtitan.rl.generator.vllm.batch_invariance import (
     force_logprobs_fn_for_batch_invariance,
 )
+from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig
 from torchtitan.rl.generator.vllm.registry import (
     register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
@@ -41,211 +49,263 @@ from torchtitan.rl.generator.vllm.stat_logger import (
 )
 from torchtitan.tools.utils import has_cuda_capability
 
-if TYPE_CHECKING:
-    from torchtitan.rl.generator.generator import VLLMGenerator
-
 logger = logging.getLogger(__name__)
 
 
-def setup_vllm(config: VLLMGenerator.Config) -> None:
-    """Process-wide vLLM setup, before any ``VLLMEngine`` is built: register the TorchTitan
-    model and config parser with vLLM, and select vLLM's model runner."""
-    register_to_vllm(
-        config.model,
-        parallelism=config.parallelism,
-        checkpointer_config=config.checkpointer,
-        dist_moe_runtime=config.dist_moe_runtime,
-    )
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-    if config.debug.batch_invariant:
-        # The vLLM v2 logprob Triton kernel bypasses the batch-invariant aten
-        # overrides; route it through trainer's function to match the trainer exactly.
-        force_logprobs_fn_for_batch_invariance()
-
-
-def build_engine_args(
-    config: VLLMGenerator.Config, *, model_path: str, max_num_seqs: int
-) -> EngineArgs:
-    """Build the vLLM ``EngineArgs`` for ``config``.
-
-    Args:
-        config: The generator config.
-        model_path: Path to the HF model checkpoint.
-        max_num_seqs: vLLM's upper bound on concurrently scheduled sequences.
-    """
-    model_config = config.model
-    attention_backend = model_config.first_base_attention_backend
-    assert isinstance(
-        attention_backend,
-        (VarlenInnerAttention.Config, FlexInnerAttention.Config),
-    ), "Only varlen and flex attention backends are allowed."
-
-    enable_ep = config.parallelism.expert_parallel_degree > 1
-    engine_kwargs = dict(
-        # ``model`` is the path to the HF checkpoint directory. The
-        # config is sourced from TorchTitan's model config via
-        # ``config_format=TORCHTITAN_CONFIG_FORMAT`` (no config.json
-        # read), but vLLM still uses this path to locate the
-        # tokenizer assets and the safetensors weight shards.
-        model=model_path,
-        trust_remote_code=True,
-        # Use the torchtitan custom config parser (registered by
-        # register_to_vllm in setup_vllm). It builds PretrainedConfig from
-        # model config instead of reading config.json from disk.
-        config_format=TORCHTITAN_CONFIG_FORMAT,
-        dtype=config.model_dtype,
-        tensor_parallel_size=config.parallelism.tensor_parallel_degree,
-        data_parallel_size=config.parallelism.data_parallel_degree,
-        # NOTE: Monarch launches the generator workers and sets the torch
-        # elastic distributed env; with external_launcher, vLLM uses that
-        # world to build its process groups. vLLM does not take an
-        # explicit EP degree: when this boolean is set, it converts all
-        # DP * TP ranks into the expert-parallel group for MoE layers.
-        enable_expert_parallel=enable_ep,
-        worker_cls=TORCHTITAN_WORKER_CLS,
-        # Monarch already spawned TP workers via proc mesh. "external_launcher"
-        # tells vLLM to run one worker per process (no subprocess spawning)
-        distributed_executor_backend="external_launcher",
-        gpu_memory_utilization=config.gpu_memory_limit,
-        enforce_eager=config.cuda_graph.mode == "NONE",
-        attention_config=AttentionConfig(
-            backend=(
-                AttentionBackendEnum.FLEX_ATTENTION
-                if isinstance(attention_backend, FlexInnerAttention.Config)
-                else AttentionBackendEnum.CUSTOM
-            ),
-        ),
-        # Enables RequestOutput.metrics, so generator metrics can be returned
-        disable_log_stats=False,
-        enable_cumem_allocator=False,
-        # Token-in-token-out: prompts and outputs are token ids, so vLLM
-        # needs no tokenizer. This also drops the tokenizer's eos_token_id
-        # as a stop; the generation config's eos ids are dropped by
-        # ignore_eos in _build_sampling_params.
-        skip_tokenizer_init=True,
-    )
-    engine_kwargs["max_model_len"] = model_config.max_context_length
-    # Return logprobs of the distribution vLLM samples from (after temperature). vLLM's default
-    # returns the raw model's logprobs, before temperature.
-    engine_kwargs["logprobs_mode"] = "processed_logprobs"
-    engine_kwargs["max_num_seqs"] = max_num_seqs
-    if config.max_num_batched_tokens is not None:
-        engine_kwargs["max_num_batched_tokens"] = config.max_num_batched_tokens
-    # Continuous batching requires FCFS scheduling: admission order must equal the
-    # broadcast order on every rank
-    engine_kwargs["scheduling_policy"] = "fcfs"
-    # Which sliding-window / Mamba (GDN) state blocks are hashed into the prefix
-    # cache; full-attention groups hash every block regardless.
-    # - 0 (vLLM default since v0.29): only the replay boundary (the last block
-    #   boundary before the prompt's final token) and shared-prefix junctions.
-    #   Other prompt blocks and every block crossed during decode are freed
-    #   unhashed, so a multi-turn rollout's next turn, whose prompt contains the
-    #   previous completion, cannot reuse anything past the previous prompt.
-    # - None: every full block boundary, as before v0.29. Blocks are still freed
-    #   when the request moves past them; hashed ones stay reusable until evicted.
-    engine_kwargs["prefix_cache_retention_interval"] = None
-    # FA2 requires block_size to be a multiple of 256
-    if not has_cuda_capability(9, 0):
-        engine_kwargs["block_size"] = 256
-    vllm_compilation_config = config.cuda_graph.get_vllm_compilation_config(
-        max_num_seqs=max_num_seqs,
-        max_num_batched_tokens=config.max_num_batched_tokens,
-        expert_sequence_parallel_size=config.parallelism.expert_sequence_parallel_size,
-        enable_sequence_parallel=config.parallelism.enable_sequence_parallel,
-    )
-    if vllm_compilation_config is not None:
-        engine_kwargs["compilation_config"] = vllm_compilation_config
-    if config.debug.seed is not None:
-        engine_kwargs["seed"] = config.debug.seed
-    add_extra_vllm_engine_args(engine_kwargs, config.extra_vllm_engine_args)
-    return EngineArgs(**engine_kwargs)
-
-
 def add_extra_vllm_engine_args(
-    engine_kwargs: dict[str, Any], extra_vllm_engine_args: dict[str, Any]
+    engine_kwargs: dict[str, Any], extra_engine_args: dict[str, Any]
 ) -> None:
-    """Add ``VLLMGenerator.Config.extra_vllm_engine_args`` to ``engine_kwargs`` in place.
+    """Add ``VLLMEngine.Config.extra_engine_args`` to ``engine_kwargs`` in place.
 
     Raises ``ValueError`` for keys TorchTitan already set in ``engine_kwargs`` or
     derives from a config field, so they cannot silently diverge from it.
     """
-    # EngineArgs that TorchTitan sets only when the mapped VLLMGenerator.Config
-    # field is set (or derives from it), so they may be absent from engine_kwargs.
+    # EngineArgs that TorchTitan sets only when the mapped config field is set (or
+    # derives from it), so they may be absent from engine_kwargs.
     config_field_by_engine_arg = {
-        "max_num_batched_tokens": "max_num_batched_tokens",
-        "compilation_config": "cuda_graph",
-        "seed": "debug.seed",
+        "max_num_batched_tokens": "Generator.Config.max_num_batched_tokens",
+        "compilation_config": "VLLMEngine.Config.cuda_graph",
+        "seed": "Generator.Config.debug.seed",
     }
     owned_keys = sorted(
-        extra_vllm_engine_args.keys()
+        extra_engine_args.keys()
         & (engine_kwargs.keys() | config_field_by_engine_arg.keys())
     )
     if owned_keys:
         details = ", ".join(
             (
-                f"{key} (use VLLMGenerator.Config.{config_field_by_engine_arg[key]})"
+                f"{key} (use {config_field_by_engine_arg[key]})"
                 if key in config_field_by_engine_arg
                 else key
             )
             for key in owned_keys
         )
         raise ValueError(
-            f"extra_vllm_engine_args cannot set EngineArgs that TorchTitan controls: {details}"
+            f"extra_engine_args cannot set EngineArgs that TorchTitan controls: {details}"
         )
-    engine_kwargs.update(extra_vllm_engine_args)
+    engine_kwargs.update(extra_engine_args)
 
 
-def build_stat_loggers(
-    config: VllmOtelStatLogger.Config | None, context: StatLoggerContext
-) -> list | None:
-    """Build the vLLM stat logger factories passed to ``VLLMEngine``, or None without a config."""
-    if config is None:
-        logger.info(
-            "VllmOtelStatLogger inactive because "
-            "vllm_stat_logger=None. To record vLLM metrics, set it "
-            "to VllmOtelStatLogger.Config() and set "
-            "OTEL_METRICS_EXPORTER=jsonl or otlp"
-        )
-        return None
-
-    def build_stat_logger(vllm_config, engine_index):
-        return config.build(
-            vllm_config=vllm_config,
-            engine_index=engine_index,
-            context=context,
-        )
-
-    return [build_stat_logger]
-
-
-class VLLMEngine:
+class VLLMEngine(GenerationEngine):
     """The generator's vLLM ``LLMEngine``, behind the calls the engine loop makes.
 
-    ``LLMEngine`` is not thread-safe: build and use this only on the generator's
-    engine thread (see ``EngineLoop``).
-
-    Args:
-        engine_args: From ``build_engine_args``.
-        reset_kv_cache_on_model_state_dict_load: ``VLLMGenerator.Config``'s field.
-            When False, each prompt is salted with its request's min policy version,
-            so it reuses only KV computed under that version.
-        stat_loggers: From ``build_stat_loggers``.
+    See ``GenerationEngine`` for the build arguments and the threading contract;
+    ``LLMEngine`` is not thread-safe.
     """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(GenerationEngine.Config):
+        cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
+        """CUDA graph capture settings for the vLLM engine."""
+
+        extra_engine_args: dict[str, Any] = field(default_factory=dict)
+        """Additional keyword arguments passed to vLLM's ``EngineArgs``, for engine
+        options without a dedicated field (e.g. ``{"watermark": 0.03}``). vLLM
+        validates them. Keys that TorchTitan sets itself, or derives from a config
+        field (e.g. ``max_num_batched_tokens``), raise a ``ValueError``; see
+        ``add_extra_vllm_engine_args``."""
+
+        stat_logger: VllmOtelStatLogger.Config | None = None
+        """Optional logger instantiated on TP rank 0 to export vLLM metrics."""
 
     def __init__(
         self,
-        engine_args: EngineArgs,
+        config: Config,
         *,
+        model: Decoder.Config,
+        parallelism: InferenceParallelismConfig,
+        model_path: str,
+        max_num_seqs: int,
+        model_dtype: str,
+        gpu_memory_limit: float,
+        max_num_batched_tokens: int | None,
+        checkpointer: CheckpointManager.Config | None,
+        dist_moe_runtime: DistMoeRuntime.Config | None,
+        debug: DebugConfig,
         reset_kv_cache_on_model_state_dict_load: bool,
-        stat_loggers: list | None = None,
+        rank: int,
+        generator_name: str,
+        output_dir: str,
     ):
+        self.config = config
+        self._reset_kv_cache_on_model_state_dict_load = (
+            reset_kv_cache_on_model_state_dict_load
+        )
+        self._setup(
+            model,
+            parallelism=parallelism,
+            checkpointer=checkpointer,
+            dist_moe_runtime=dist_moe_runtime,
+            batch_invariant=debug.batch_invariant,
+        )
+        engine_args = self._build_engine_args(
+            model,
+            parallelism=parallelism,
+            model_path=model_path,
+            max_num_seqs=max_num_seqs,
+            model_dtype=model_dtype,
+            gpu_memory_limit=gpu_memory_limit,
+            max_num_batched_tokens=max_num_batched_tokens,
+            seed=debug.seed,
+        )
+        tp_degree = parallelism.tensor_parallel_degree
+        stat_loggers = None
+        if rank % tp_degree == 0:
+            stat_loggers = self._build_stat_loggers(
+                StatLoggerContext(
+                    rank=rank,
+                    tp_rank=0,
+                    dp_rank=rank // tp_degree,
+                    generator_name=generator_name,
+                    output_dir=output_dir,
+                )
+            )
         logger.info("Initializing LLMEngine from EngineArgs...")
         self._engine = LLMEngine.from_engine_args(
             engine_args, stat_loggers=stat_loggers
         )
-        self._reset_kv_cache_on_model_state_dict_load = (
-            reset_kv_cache_on_model_state_dict_load
+
+    @staticmethod
+    def _setup(
+        model: Decoder.Config,
+        *,
+        parallelism: InferenceParallelismConfig,
+        checkpointer: CheckpointManager.Config | None,
+        dist_moe_runtime: DistMoeRuntime.Config | None,
+        batch_invariant: bool,
+    ) -> None:
+        """Process-wide vLLM setup before the engine build: register the TorchTitan model
+        and config parser with vLLM, and select vLLM's model runner."""
+        register_to_vllm(
+            model,
+            parallelism=parallelism,
+            checkpointer_config=checkpointer,
+            dist_moe_runtime=dist_moe_runtime,
         )
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+        if batch_invariant:
+            # The vLLM v2 logprob Triton kernel bypasses the batch-invariant aten
+            # overrides; route it through trainer's function to match the trainer exactly.
+            force_logprobs_fn_for_batch_invariance()
+
+    def _build_engine_args(
+        self,
+        model: Decoder.Config,
+        *,
+        parallelism: InferenceParallelismConfig,
+        model_path: str,
+        max_num_seqs: int,
+        model_dtype: str,
+        gpu_memory_limit: float,
+        max_num_batched_tokens: int | None,
+        seed: int | None,
+    ) -> EngineArgs:
+        """Build the vLLM ``EngineArgs`` (see ``GenerationEngine`` for the arguments)."""
+        attention_backend = model.first_base_attention_backend
+        assert isinstance(
+            attention_backend,
+            (VarlenInnerAttention.Config, FlexInnerAttention.Config),
+        ), "Only varlen and flex attention backends are allowed."
+
+        enable_ep = parallelism.expert_parallel_degree > 1
+        engine_kwargs = dict(
+            # ``model`` is the path to the HF checkpoint directory. The
+            # config is sourced from TorchTitan's model config via
+            # ``config_format=TORCHTITAN_CONFIG_FORMAT`` (no config.json
+            # read), but vLLM still uses this path to locate the
+            # tokenizer assets and the safetensors weight shards.
+            model=model_path,
+            trust_remote_code=True,
+            # Use the torchtitan custom config parser (registered by
+            # register_to_vllm in _setup). It builds PretrainedConfig from
+            # model config instead of reading config.json from disk.
+            config_format=TORCHTITAN_CONFIG_FORMAT,
+            dtype=model_dtype,
+            tensor_parallel_size=parallelism.tensor_parallel_degree,
+            data_parallel_size=parallelism.data_parallel_degree,
+            # NOTE: Monarch launches the generator workers and sets the torch
+            # elastic distributed env; with external_launcher, vLLM uses that
+            # world to build its process groups. vLLM does not take an
+            # explicit EP degree: when this boolean is set, it converts all
+            # DP * TP ranks into the expert-parallel group for MoE layers.
+            enable_expert_parallel=enable_ep,
+            worker_cls=TORCHTITAN_WORKER_CLS,
+            # Monarch already spawned TP workers via proc mesh. "external_launcher"
+            # tells vLLM to run one worker per process (no subprocess spawning)
+            distributed_executor_backend="external_launcher",
+            gpu_memory_utilization=gpu_memory_limit,
+            enforce_eager=self.config.cuda_graph.mode == "NONE",
+            attention_config=AttentionConfig(
+                backend=(
+                    AttentionBackendEnum.FLEX_ATTENTION
+                    if isinstance(attention_backend, FlexInnerAttention.Config)
+                    else AttentionBackendEnum.CUSTOM
+                ),
+            ),
+            # Enables RequestOutput.metrics, so generator metrics can be returned
+            disable_log_stats=False,
+            enable_cumem_allocator=False,
+            # Token-in-token-out: prompts and outputs are token ids, so vLLM
+            # needs no tokenizer. This also drops the tokenizer's eos_token_id
+            # as a stop; the generation config's eos ids are dropped by
+            # ignore_eos in _build_sampling_params.
+            skip_tokenizer_init=True,
+        )
+        engine_kwargs["max_model_len"] = model.max_context_length
+        # Return logprobs of the distribution vLLM samples from (after temperature). vLLM's default
+        # returns the raw model's logprobs, before temperature.
+        engine_kwargs["logprobs_mode"] = "processed_logprobs"
+        engine_kwargs["max_num_seqs"] = max_num_seqs
+        if max_num_batched_tokens is not None:
+            engine_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
+        # Continuous batching requires FCFS scheduling: admission order must equal the
+        # broadcast order on every rank
+        engine_kwargs["scheduling_policy"] = "fcfs"
+        # Which sliding-window / Mamba (GDN) state blocks are hashed into the prefix
+        # cache; full-attention groups hash every block regardless.
+        # - 0 (vLLM default since v0.29): only the replay boundary (the last block
+        #   boundary before the prompt's final token) and shared-prefix junctions.
+        #   Other prompt blocks and every block crossed during decode are freed
+        #   unhashed, so a multi-turn rollout's next turn, whose prompt contains the
+        #   previous completion, cannot reuse anything past the previous prompt.
+        # - None: every full block boundary, as before v0.29. Blocks are still freed
+        #   when the request moves past them; hashed ones stay reusable until evicted.
+        engine_kwargs["prefix_cache_retention_interval"] = None
+        # FA2 requires block_size to be a multiple of 256
+        if not has_cuda_capability(9, 0):
+            engine_kwargs["block_size"] = 256
+        vllm_compilation_config = self.config.cuda_graph.get_vllm_compilation_config(
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            expert_sequence_parallel_size=parallelism.expert_sequence_parallel_size,
+            enable_sequence_parallel=parallelism.enable_sequence_parallel,
+        )
+        if vllm_compilation_config is not None:
+            engine_kwargs["compilation_config"] = vllm_compilation_config
+        if seed is not None:
+            engine_kwargs["seed"] = seed
+        add_extra_vllm_engine_args(engine_kwargs, self.config.extra_engine_args)
+        return EngineArgs(**engine_kwargs)
+
+    def _build_stat_loggers(self, context: StatLoggerContext) -> list | None:
+        """Build the vLLM stat logger factories, or None without ``config.stat_logger``."""
+        stat_logger_config = self.config.stat_logger
+        if stat_logger_config is None:
+            logger.info(
+                "VllmOtelStatLogger inactive because stat_logger=None. To record vLLM "
+                "metrics, set VLLMEngine.Config.stat_logger to VllmOtelStatLogger.Config() "
+                "and set OTEL_METRICS_EXPORTER=jsonl or otlp"
+            )
+            return None
+
+        def build_stat_logger(vllm_config, engine_index):
+            return stat_logger_config.build(
+                vllm_config=vllm_config,
+                engine_index=engine_index,
+                context=context,
+            )
+
+        return [build_stat_logger]
 
     @property
     def data_parallel_size(self) -> int:

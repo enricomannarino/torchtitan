@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from monarch.actor import Actor, Channel, concurrent_endpoint, context, current_rank
 
-from torchtitan.rl.generator.generator import VLLMGenerator
+from torchtitan.rl.generator.generator import Generator
 
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.rollout.types import Completion
@@ -19,7 +19,7 @@ from torchtitan.rl.rollout.types import Completion
 class _GeneratorActorEndpoints:
     def __init__(
         self,
-        config: VLLMGenerator.Config,
+        config: Generator.Config,
         *,
         model_path: str,
         max_num_seqs: int,
@@ -88,5 +88,5 @@ class _GeneratorActorEndpoints:
         await super().close()
 
 
-class VLLMGeneratorActor(Actor, _GeneratorActorEndpoints, VLLMGenerator):
-    """Expose a standalone :class:`VLLMGenerator` through Monarch endpoints."""
+class GeneratorActor(Actor, _GeneratorActorEndpoints, Generator):
+    """Expose a standalone :class:`Generator` through Monarch endpoints."""

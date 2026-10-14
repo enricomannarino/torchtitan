@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The RL generator service: rollout generation with a vLLM engine."""
+"""The RL generator service: rollout generation with an inference engine."""
 
 from __future__ import annotations
 
@@ -27,41 +27,40 @@ from torchtitan.models.common.dist_moe import DistMoeRuntime
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.logging import init_logger
 from torchtitan.rl.generator.dispatcher import RequestDispatcher
-from torchtitan.rl.generator.engine_loop import EngineLoop, EngineThread
+from torchtitan.rl.generator.engine import GenerationEngine
+from torchtitan.rl.generator.engine_loop import EngineLoop, EngineLoopThread
 from torchtitan.rl.generator.parallelism import InferenceParallelismConfig
 from torchtitan.rl.generator.types import EngineRequest, SamplingConfig
-from torchtitan.rl.generator.vllm.config import VLLMCudaGraphConfig
-from torchtitan.rl.generator.vllm.engine import (
-    build_engine_args,
-    build_stat_loggers,
-    setup_vllm,
-    VLLMEngine,
-)
-from torchtitan.rl.generator.vllm.stat_logger import (
-    StatLoggerContext,
-    VllmOtelStatLogger,
-)
 from torchtitan.rl.rollout.types import Completion
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
 
 logger = logging.getLogger(__name__)
 
 
-class VLLMGenerator(Configurable):
-    """Generates completions with a vLLM engine, behind the endpoints the controller and router call.
+def _default_engine_config() -> GenerationEngine.Config:
+    # Imported here so the generator depends on vLLM only when it is the configured engine.
+    from torchtitan.rl.generator.vllm.engine import VLLMEngine
+
+    return VLLMEngine.Config()
+
+
+class Generator(Configurable):
+    """Generates completions with an inference engine, behind the endpoints the controller and
+    router call.
 
     The controller fires independent calls (`generate`, `load_model_state_dict`, `close`), and the
     router calls `prefetch_model_state_dict` before `load_model_state_dict` to prefetch weights into
-    CPU. Each rank runs one SPMD engine loop on a dedicated engine thread; rank 0 takes the calls
-    and drives the other ranks through it.
+    CPU. Each rank runs one SPMD engine loop on a dedicated engine loop thread; rank 0 takes the
+    calls and drives the other ranks through it.
 
     The generator is split by concern:
     - this class: the endpoints, setup, and the model state dict prefetch;
-    - `EngineLoop` (`engine_loop.py`): the engine thread's loop, which turns queued calls into
-      engine steps and model state dict loads on every rank;
+    - `EngineLoop` (`engine_loop.py`): the loop that turns queued calls into engine steps and
+      model state dict loads on every rank;
     - `RequestDispatcher` (`dispatcher.py`): routes requests across data-parallel replicas and
       resolves each call's reply when its request finishes;
-    - `VLLMEngine` (`vllm/engine.py`): every vLLM call.
+    - `GenerationEngine` (`engine.py`): the inference engine interface, implemented for vLLM by
+      `VLLMEngine` (`vllm/engine.py`) and selected by `Config.engine`.
 
     `prefetch_model_state_dict` runs on the caller's event loop and writes the staging buffers the
     engine loop reads on a load: the router awaits it before `load_model_state_dict`, and the
@@ -70,8 +69,8 @@ class VLLMGenerator(Configurable):
     Args:
         config: Generator-specific configuration, including its model.
         model_path: Path to the HF model checkpoint.
-        max_num_seqs: vLLM's upper bound on concurrently scheduled sequences (vLLM admits fewer if KV
-            is tight); also sets the CUDA-graph capture sizes.
+        max_num_seqs: The engine's upper bound on concurrently scheduled sequences (it may admit
+            fewer if KV is tight).
         output_dir: Structured-logger output directory.
         open_result_channel: Opens the asynchronous channel used to fan in
             completions from nonzero data-parallel replicas to rank 0. It must
@@ -83,8 +82,7 @@ class VLLMGenerator(Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        """Generator actor configuration.
-        TODO: Expose a EngineConfig field to passing config to vLLM Engine"""
+        """Generator configuration."""
 
         model: Decoder.Config
         """Generator model config, built for ``parallelism.to_training()``.
@@ -96,7 +94,11 @@ class VLLMGenerator(Configurable):
         parallelism: InferenceParallelismConfig = field(
             default_factory=InferenceParallelismConfig
         )
-        """Parallelism configuration for the vLLM engine."""
+        """Parallelism configuration for the inference engine."""
+
+        engine: GenerationEngine.Config = field(default_factory=_default_engine_config)
+        """The inference engine and its engine-specific settings, selected by config type,
+        e.g. ``VLLMEngine.Config()`` (default)."""
 
         intra_generator_router: IntraGeneratorRouter.Config = field(
             default_factory=IntraGeneratorRouter.Config
@@ -115,28 +117,18 @@ class VLLMGenerator(Configurable):
         over its own, smaller, expert-parallel mesh."""
 
         model_dtype: str = "bfloat16"
-        """Data type for model weights, passed directly to vLLM (auto, float16, bfloat16, float32)."""
+        """Data type for model weights, passed to the engine (auto, float16, bfloat16, float32)."""
 
         gpu_memory_limit: float = 0.9
-        """Fraction of GPU memory to use for the vLLM engine (0.0 to 1.0)."""
+        """Fraction of GPU memory to use for the engine (0.0 to 1.0)."""
 
         max_num_batched_tokens: int | None = None
-        """vLLM chunked-prefill chunk size: max tokens scheduled per engine step
-        (prefill + decode, summed over the batch). ``None`` (default) leaves
-        vLLM's own engine default in place."""
-
-        extra_vllm_engine_args: dict[str, Any] = field(default_factory=dict)
-        """Additional keyword arguments passed to vLLM's ``EngineArgs``, for engine
-        options without a dedicated field here (e.g. ``{"watermark": 0.03}``). vLLM
-        validates them. Keys that TorchTitan sets itself, or derives from a field of
-        this config (e.g. ``max_num_batched_tokens``), raise a ``ValueError``; see
-        ``add_extra_vllm_engine_args``."""
-
-        cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
-        """CUDA graph capture settings for the vLLM engine."""
+        """The engine's chunked-prefill chunk size: max tokens scheduled per engine step
+        (prefill + decode, summed over the batch). ``None`` (default) leaves the
+        engine's own default in place."""
 
         checkpointer: CheckpointManager.Config | None = None
-        """Optional initial-weight loader for the vLLM wrapper.
+        """Optional initial-weight loader for the engine's model.
 
         In the RL loop this stays ``None`` because weights arrive from
         TorchStore. Standalone inference supplies a config that loads the
@@ -158,14 +150,11 @@ class VLLMGenerator(Configurable):
         cache salt pinned when this generator first admitted it, so its rollouts and
         later turns reuse its KV across model state dict loads, while new groups use the current
         version.
-        Enable this to clear prefix-cache entries and preempt running requests; vLLM
+        Enable this to clear prefix-cache entries and preempt running requests; the engine
         then recomputes their KV under the new weights when they resume."""
 
-        vllm_stat_logger: VllmOtelStatLogger.Config | None = None
-        """Optional logger instantiated on TP rank 0 to export vLLM metrics."""
-
         def __post_init__(self):
-            # The generator runs vLLM full expert parallelism: vLLM forms the EP
+            # The generator runs full expert parallelism: the engine forms the EP
             # group from all DP*TP ranks, so expert_parallel_degree must equal
             # data_parallel_degree * tensor_parallel_degree (or 1 to disable EP).
             p = self.parallelism
@@ -225,41 +214,38 @@ class VLLMGenerator(Configurable):
         tp_rank = self._rank % tp_degree
 
         set_batch_invariance(config.debug.batch_invariant)
-        setup_vllm(config)
         self._set_determinism(config.debug)
 
-        engine_args = build_engine_args(
-            config, model_path=model_path, max_num_seqs=max_num_seqs
-        )
-        with sl.log_trace_span("vllm_init"):
-            stat_loggers = None
-            if tp_rank == 0:
-                stat_loggers = build_stat_loggers(
-                    config.vllm_stat_logger,
-                    StatLoggerContext(
-                        rank=self._rank,
-                        tp_rank=tp_rank,
-                        dp_rank=dp_rank,
-                        generator_name=generator_name,
-                        output_dir=output_dir,
-                    ),
-                )
-            # The engine is built and used only on the engine thread (see `EngineLoop`).
-            self._engine_thread = EngineThread(name="vllm-engine")
-            engine = self._engine_thread.call(
-                lambda: VLLMEngine(
-                    engine_args,
+        with sl.log_trace_span("engine_init"):
+            # The engine is built and used only on the engine loop thread (see `EngineLoop`).
+            self._engine_loop_thread = EngineLoopThread(name="engine-loop")
+            engine: GenerationEngine = self._engine_loop_thread.call(
+                lambda: config.engine.build(
+                    model=config.model,
+                    parallelism=config.parallelism,
+                    model_path=model_path,
+                    max_num_seqs=max_num_seqs,
+                    model_dtype=config.model_dtype,
+                    gpu_memory_limit=config.gpu_memory_limit,
+                    max_num_batched_tokens=config.max_num_batched_tokens,
+                    checkpointer=config.checkpointer,
+                    dist_moe_runtime=config.dist_moe_runtime,
+                    debug=config.debug,
                     reset_kv_cache_on_model_state_dict_load=(
                         config.reset_kv_cache_on_model_state_dict_load
                     ),
-                    stat_loggers=stat_loggers,
+                    rank=self._rank,
+                    generator_name=generator_name,
+                    output_dir=output_dir,
                 )
             )
             # The prefetch buffers below and each prefetch's TorchStore read pin memory through
             # the CUDA runtime, on the calling thread's device. Both run on this thread, which
             # would otherwise use device 0, rank 0's GPU.
-            torch.cuda.set_device(self._engine_thread.call(torch.cuda.current_device))
-            logger.info("vLLM rollout engine initialized")
+            torch.cuda.set_device(
+                self._engine_loop_thread.call(torch.cuda.current_device)
+            )
+            logger.info("Generator engine initialized")
 
         # The default PG was initialized during engine build. Confirm the configured
         # rank matches the torch-distributed global rank so the two views cannot
@@ -270,18 +256,18 @@ class VLLMGenerator(Configurable):
                 f"rank mismatch: configured rank ({self._rank}) != "
                 f"torch dist.get_rank() ({torch_distributed_rank})"
             )
-        # Confirm the DP layout we computed above matches what vLLM derived
-        # independently during engine build, so the two views can't silently diverge.
+        # Confirm the DP layout we computed above matches what the engine derived
+        # independently during its build, so the two views can't silently diverge.
         if engine.data_parallel_size != dp_degree:
             raise RuntimeError(
                 f"DP layout mismatch on rank {self._rank}: our dp_size "
-                f"({dp_degree}) != vLLM data_parallel_size "
+                f"({dp_degree}) != engine data_parallel_size "
                 f"({engine.data_parallel_size})"
             )
         if engine.data_parallel_rank != dp_rank:
             raise RuntimeError(
                 f"DP layout mismatch on rank {self._rank}: our dp_rank "
-                f"({dp_rank}) != vLLM data_parallel_rank "
+                f"({dp_rank}) != engine data_parallel_rank "
                 f"({engine.data_parallel_rank})"
             )
 
@@ -292,7 +278,7 @@ class VLLMGenerator(Configurable):
         # generator keeps no reference to it.
         self._engine_loop = EngineLoop(
             engine,
-            event_loop=self._engine_thread.event_loop,
+            event_loop=self._engine_loop_thread.event_loop,
             request_dispatcher=RequestDispatcher(
                 rank=self._rank,
                 dp_rank=dp_rank,
@@ -308,7 +294,7 @@ class VLLMGenerator(Configurable):
             reset_kv_cache_on_model_state_dict_load=config.reset_kv_cache_on_model_state_dict_load,
         )
 
-        logger.info("Generator initialized with vLLM engine")
+        logger.info("Generator initialized")
 
     @staticmethod
     def _set_determinism(debug: DebugConfig) -> None:
@@ -365,10 +351,10 @@ class VLLMGenerator(Configurable):
         Can be accepted by rank 0 only (rank 0 owns the queue + replies and
         drives the followers through the engine loop). Returns the `Completion`,
         which carries its own per-generation metrics (`Completion.metrics`) that
-        the controller attaches to the rollout turn. If vLLM rejects the request
+        the controller attaches to the rollout turn. If the engine rejects the request
         when the engine loop admits it (e.g. a prompt that leaves no room for an
-        output token), only this call raises vLLM's error (`VLLMValidationError` or
-        `ValueError`).
+        output token), only this call raises the engine's error (with vLLM,
+        `VLLMValidationError` or `ValueError`).
 
         Args:
             prompt_token_ids: One tokenized prompt `[token_ids]`.
@@ -453,5 +439,5 @@ class VLLMGenerator(Configurable):
         )
 
     async def close(self) -> None:
-        """Stop the engine loop, which releases the dispatcher and the vLLM engine on exit."""
+        """Stop the engine loop, which releases the dispatcher and the engine on exit."""
         await self._engine_loop.close()
